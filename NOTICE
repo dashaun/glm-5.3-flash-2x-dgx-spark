@@ -1,0 +1,13 @@
+glm-5.3-flash-2x-dgx-spark: GLM-5.3-Flash-NVFP4-Spark on 2x DGX Spark (vLLM + Ray in Docker)
+Copyright 2026 DaShaun Carter
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product is adapted from deepseek-v4-flash-2x-dgx-spark
+(https://github.com/dashaun/deepseek-v4-flash-2x-dgx-spark), Copyright 2026 DaShaun Carter,
+licensed under the Apache License, Version 2.0.
+
+The model configuration is adapted from eugr/spark-vllm-docker
+(https://github.com/eugr/spark-vllm-docker), licensed under the MIT License:
+  recipes/glm-5.3-flash.yaml
+  Copyright (c) 2026 Eugene Rakhmatulin
