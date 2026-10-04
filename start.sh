@@ -32,7 +32,7 @@ step_preflight() {
 }
 
 preflight_node() {
-  local node=$1 host home dir ref dev state avail
+  local node=$1 host home dir ref dev state avail missing
   host=$(node_host "$node")
   rsh "$host" true || die "cannot SSH to $host"
 
@@ -49,6 +49,13 @@ preflight_node() {
   if rsh "$host" find "$dir/blobs" -name '*.incomplete' | grep -q .; then
     die "incomplete download of $MODEL_ID on $host"
   fi
+  # A metadata-only snapshot (config.json but no weights) passes the checks above.
+  # shellcheck disable=SC2016 # script runs remotely
+  missing=$(rsh "$host" bash -c 'cd "$1" && test -f model.safetensors.index.json || { echo model.safetensors.index.json; exit; }
+    grep -oE "\"[^\"]+\.safetensors\"" model.safetensors.index.json | tr -d "\"" | sort -u |
+      while read -r f; do test -e "$f" || echo "$f"; done' _ "$dir/snapshots/$ref")
+  [[ -z "$missing" ]] ||
+    die "$(echo "$missing" | wc -l | tr -d ' ') weight file(s) of $MODEL_ID missing on $host, e.g. $(echo "$missing" | head -1) — download it inside the container (README, step 2)"
 
   for dev in ${IB_HCA//,/ }; do
     state=$(rsh "$host" cat "/sys/class/infiniband/$dev/ports/1/state" 2>/dev/null || true)

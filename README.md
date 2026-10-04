@@ -1,118 +1,92 @@
 # GLM-5.3-Flash-2x-DGX-Spark
 
-This repository contains the necessary scripts and configurations to deploy and run the GLM-5.3-Flash-NVFP4-Spark model on a 2x DGX Spark cluster using vLLM with tensor parallelism 2.
-
-## Overview
-
-This setup deploys the GLM-5.3-Flash model (165B parameters, ~166 GB) on two DGX Spark nodes using vLLM with Ray distributed execution. The model uses NVFP4 quantization and is optimized for the DGX Spark architecture with B12X attention backend.
-
-## Architecture
-
-- **Model**: GLM-5.3-Flash-NVFP4-Spark (165B parameters)
-- **Deployment**: 2x DGX Spark nodes with TP=2 over Ray
-- **Framework**: vLLM with B12X attention backend
-- **Quantization**: NVFP4 (165B params, ~166 GB)
-- **Communication**: InfiniBand with RoCE devices
+Serve `local-inference-lab/GLM-5.3-Flash-NVFP4-Spark` (165B params, NVFP4) on two DGX Sparks with vLLM, tensor parallel 2 over Ray. Everything runs from your workstation over SSH. Nothing gets installed on the Sparks; the software lives in the `eugr/spark-vllm-b12x` image.
 
 ## Prerequisites
 
-- Two DGX Spark nodes (spark-dc25 and spark-a9cf)
-- Tailscale or direct SSH access to both nodes
-- Pre-downloaded model in offline mode
-- Docker installed on both nodes
-- Sufficient disk space (~166 GB per node for model cache)
+- Two DGX Sparks reachable over SSH (Tailscale, DNS or `~/.ssh/config`), linked by QSFP
+- Docker on both, with the pinned image pulled
+- ~175 GiB free per node for the model cache
+- A Hugging Face token for the one-time download
 
-## Setup Instructions
+## Setup
 
-### 1. Configure Cluster Settings
+### 1. Configure the cluster
 
-Edit `cluster.env` to set your cluster configuration:
 ```bash
-HEAD_HOST=spark-dc25
-WORKER_HOST=spark-a9cf
-HEAD_IP=192.168.200.1
-WORKER_IP=192.168.200.2
+cp cluster.env.example cluster.env   # git-ignored; set HEAD_HOST, WORKER_HOST
+./network.sh discover                # fills ETH_IF, IB_HCA, IB_GID_INDEX, HEAD_IP, WORKER_IP
 ```
 
-### 2. Configure Model Settings
+### 2. Download the model on both nodes
 
-The model is pre-configured in `models/glm-5.3-flash-nvfp4-spark.env` with:
-- Model ID: `local-inference-lab/GLM-5.3-Flash-NVFP4-Spark`
-- Revision: `a608241037e4c2565356bff7ca293f2133888f88`
-- Tensor Parallel Size: 2
-- HF_HUB_OFFLINE=1 (for offline mode)
-
-### 3. Prepare Model Cache
-
-Since this uses offline mode, you must manually download the model:
-```bash
-# On spark-dc25
-HF_HUB_OFFLINE=1 huggingface-cli download --revision a608241037e4c2565356bff7ca293f2133888f88 local-inference-lab/GLM-5.3-Flash-NVFP4-Spark
-
-# On spark-a9cf
-HF_HUB_OFFLINE=1 huggingface-cli download --revision a608241037e4c2565356bff7ca293f2133888f88 local-inference-lab/GLM-5.3-Flash-NVFP4-Spark
-```
-
-### 4. Deploy and Start Services
+The containers run with `HF_HUB_OFFLINE=1`, so vLLM never pulls weights at startup. Download them once per node inside the container, which writes to the bind-mounted `~/.cache/huggingface` on the host. The token goes over stdin so it never shows up in a process list or on disk:
 
 ```bash
-# Clear existing model cache
-./clear_model_cache.sh
-
-# Start containers
 ./start.sh containers
+read -rs HF_TOKEN
+for h in spark-head spark-worker; do
+  # ssh re-splits its command on the host: keep the container script inside both quote levels.
+  printf '%s\n' "$HF_TOKEN" | ssh "$h" "docker exec -i vllm_node bash -c 'read -r HF_TOKEN; export HF_TOKEN HF_HUB_OFFLINE=0; exec hf download local-inference-lab/GLM-5.3-Flash-NVFP4-Spark --revision a608241037e4c2565356bff7ca293f2133888f88'" &
+done; wait
+```
 
-# Start vLLM service
-./start.sh serve
+Interrupted downloads resume. `./start.sh preflight` refuses to continue until every file referenced by `model.safetensors.index.json` is present on both nodes. That's 35 `model-000NN` shards (named "of-00036") plus the `hf-nonexpert`, `mtp` and `inputscales` files.
 
-# Check status
+**Faster on a shared uplink.** Both Sparks usually share one internet connection, so downloading on both nodes pays for every byte twice. The QSFP link between them is far faster (measured ~1.1 GB/s). Pass `hf download` a subset of filenames on each node, then stream each node's snapshot symlinks and blobs to the other container over the QSFP IPs (tar into a Python socket; the image has no `nc`). After that:
+- Copy `refs/main` from a node that has it. `hf download --revision <sha>` doesn't write it.
+- Once no download is running, delete leftover `blobs/*.incomplete` files. Preflight rejects them.
+- Spot-check a few blobs with `sha256sum`. An LFS blob's filename is its SHA-256.
+
+### 3. Start
+
+```bash
+./start.sh          # preflight containers ray mods serve wait
 ./status.sh
 ```
 
-## Scripts Overview
+`./start.sh help` lists the individual steps. Each one is safe to re-run.
 
-- `start.sh` - Main orchestration script for deployment
-- `stop.sh` - Stop vLLM service and containers
-- `status.sh` - Show cluster status and health
-- `loadtest.py` - Load testing script for validation
-- `clear_model_cache.sh` - Clear model cache on both nodes
-- `fix_permissions.sh` - Attempt to fix model cache ownership issues
+## Results
 
-## Key Features
+Measured on 2026-10-03 with the pinned image and the `SERVE_ARGS` in the model file:
 
-- **Offline Mode Support**: Uses `HF_HUB_OFFLINE=1` to prevent internet access
-- **Tensor Parallelism**: 2x DGX Spark with TP=2 over Ray
-- **B12X Optimizations**: Uses B12X attention backend for performance
-- **Persistent Caching**: Mounts compile caches for faster restarts
-- **NCCL Integration**: Uses InfiniBand with RoCE for efficient communication
+| Step | Time |
+|---|---|
+| Weight load (per rank, from local cache) | ~35 s |
+| Model load total (89 GiB per rank) | 71 s |
+| CUDA graph capture | 34 s |
+| `vllm serve` launch to `/health` OK | 283 s |
+
+While serving, each node shows only 1–2 GiB of host memory available (`--gpu-memory-utilization 0.85` on unified memory). Leave the Sparks to vLLM.
+
+## Configuration
+
+- `cluster.env`: hosts, QSFP IPs, RoCE devices, image digest, ports, timeouts
+- `models/glm-5.3-flash-nvfp4-spark.env`: model ID and revision, container env, `vllm serve` flags
+
+Container env changes need `./stop.sh && ./start.sh`. `SERVE_ARGS` changes need only `./stop.sh serve && ./start.sh serve`.
+
+## Scripts
+
+- `start.sh`: bring the cluster up step by step
+- `stop.sh`: stop vLLM (`serve`) or everything
+- `status.sh`: containers, Ray, vLLM, health (read-only)
+- `network.sh`: discover and verify the QSFP/RoCE links
+- `loadtest.py`: load the live API (standard library only)
 
 ## Troubleshooting
 
-### Model Loading Issues
-If vLLM fails to start due to model loading issues:
-1. Verify model cache is properly downloaded in offline mode
-2. Check that model cache directories are owned by the correct user
-3. Ensure both nodes have synchronized model cache with correct revision
+- **Health never goes green and the log stops at "Loading model from scratch".** The weights aren't cached, so vLLM is trying to download them. Run `./start.sh preflight` to see what's missing, then do step 2.
+- **Preflight says "incomplete download" but nothing is downloading.** An aborted download left `blobs/*.incomplete` files behind. Check that no `hf download` or `vllm serve` is running, then delete them.
+- **Root-owned directories under `~/.cache/huggingface`.** That's expected. The container runs as root and writes to the bind-mounted cache. The directories are world-readable, so preflight can still check them over SSH.
 
-### Permission Issues
-If you encounter permission issues:
-1. Run `./clear_model_cache.sh` to reset cache state
-2. Manually download model in offline mode on both nodes
-3. Verify cache directory ownership on both nodes
+## Sources
 
-## Performance Considerations
-
-- The model requires ~166 GB of storage per node
-- Uses B12X attention backend for optimal performance
-- Configured with `gpu-memory-utilization 0.87` for stable operation
-- Uses `--max-model-len 500000` to manage memory pressure
-- Implements speculative decoding for improved throughput
-
-## Documentation
-
-- **SOLUTION.md**: Complete solution for model loading issues
-- **VERIFY.md**: Step-by-step verification process
+- Adapted from [deepseek-v4-flash-2x-dgx-spark](https://github.com/dashaun/deepseek-v4-flash-2x-dgx-spark).
+- Model settings from [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) `recipes/glm-5.3-flash.yaml` (commit 53bd8e0). See `NOTICE`.
+- Model: [local-inference-lab/GLM-5.3-Flash-NVFP4-Spark](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-NVFP4-Spark) @ `a608241`.
 
 ## License
 
-This project is licensed under the Apache-2.0 License - see the LICENSE file for details.
+Apache-2.0. See `LICENSE`.

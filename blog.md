@@ -1,60 +1,83 @@
-# Resolving GLM-5.3-Flash Model Loading Issues on DGX Spark Cluster
+# GLM-5.3-Flash on Two DGX Sparks: The Weights Were Never There
 
-## The Problem
+```
+(Worker_TP1 pid=289) INFO [model_runner.py:390] Loading model from scratch...
+```
 
-We encountered a frustrating issue while trying to deploy the GLM-5.3-Flash-NVFP4-Spark model on a two-node DGX Spark cluster. Despite setting `HF_HUB_OFFLINE=1` to enable offline mode, the vLLM service would fail to start with errors indicating it couldn't find the model in the cache. The error message pointed to a missing model file at `/home/dashaun/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-Spark/refs/main`, suggesting the model wasn't properly cached.
+That was the last line in the log. Twenty minutes later it was still the last line. The containers were up, Ray saw both GPUs, `vllm serve` had a PID. Nothing was crashing, so nothing looked broken.
 
-## Initial Investigation
+## What was actually happening
 
-Our investigation revealed several key issues:
+The model cache told the story:
 
-1. **Incorrect Model Cache Ownership**: While the model cache directory existed, it was owned by `root` instead of the `dashaun` user. This caused permission issues when vLLM tried to access the cached files.
+```
+head:   4.7G   0 safetensors in the snapshot, 16 *.incomplete blobs
+worker: 18G    no refs/main at all,           8 *.incomplete blobs
+```
 
-2. **Incomplete Model Cache**: Even though the cache directory existed, it contained only a few files and was missing critical model components.
+`local-inference-lab/GLM-5.3-Flash-NVFP4-Spark` is 58 files and 174.8 GiB. Neither node had it. The model env had `HF_HUB_OFFLINE=0`, right under a comment saying "never reach out to the Hub at startup." So vLLM did the polite thing and started downloading 175 GiB on each node, with no token, at 8 MiB/s on one Spark and 40 MiB/s on the other. "Loading model from scratch" meant "see you in six hours."
 
-3. **Offline Mode Limitations**: Setting `HF_HUB_OFFLINE=1` doesn't completely prevent all network activity - the system still attempts to access the model cache, which failed due to ownership issues.
+An earlier pass at this went down the wrong road. It saw root-owned directories in `~/.cache/huggingface` and decided the problem was ownership. It wasn't. The container runs as root and writes into the bind-mounted cache, so root-owned directories are just what that looks like. That detour came with `sudo chown`, a `pip install` on the host and a pile of "clear the cache" scripts. None of it touched the actual problem, and all of it broke the one rule this repo has: install nothing on the Sparks.
 
-4. **Container Environment Mismatch**: The container environment correctly set `HF_HUB_OFFLINE=1`, but the model download process still attempted to access the cache, leading to failures.
+## Fix the config, then make preflight honest
 
-## The Solution Approach
+First, the flag:
 
-Rather than relying solely on automated cache clearing, we took a systematic approach to resolve the issues:
+```bash
+MODEL_CONTAINER_ENV=(
+  ...
+  HF_HUB_OFFLINE=1
+)
+```
 
-### Step 1: Identify Root Cause
-We first identified that the model cache directories existed but had incorrect ownership (root vs dashaun) and incomplete files. The `clear_model_cache.sh` script was failing due to shell compatibility issues with `printenv HOME` on the DGX nodes.
+Then the part that should have caught this on day one. Preflight checked for `refs/main`, the snapshot directory and `*.incomplete` blobs. A snapshot with `config.json` and zero weights passed all three. Now it checks every file the index references:
 
-### Step 2: Fix Script Compatibility
-We corrected the `clear_model_cache.sh` script by replacing `printenv HOME` with `echo $HOME` to ensure proper shell compatibility across different environments.
+```bash
+missing=$(rsh "$host" bash -c 'cd "$1" && test -f model.safetensors.index.json || { echo model.safetensors.index.json; exit; }
+  grep -oE "\"[^\"]+\.safetensors\"" model.safetensors.index.json | tr -d "\"" | sort -u |
+    while read -r f; do test -e "$f" || echo "$f"; done' _ "$dir/snapshots/$ref")
+```
 
-### Step 3: Clear Cache on Both Nodes
-We executed the fixed `clear_model_cache.sh` script to clear the model cache on both DGX Spark nodes (spark-dc25 and spark-a9cf), ensuring both nodes started with clean caches.
+That check paid for itself an hour later.
 
-### Step 4: Manual Offline Model Download
-Due to permission restrictions preventing automatic downloads, we manually downloaded the model in offline mode on both nodes using the exact revision hash (`a608241037e4c2565356bff7ca293f2133888f88`). This involved:
-- Using `huggingface_hub` library to download the model
-- Setting `HF_HUB_OFFLINE=1` to enforce offline mode
-- Verifying the model cache was populated with correct revision files
+## Download once, then let QSFP do the rest
 
-### Step 5: Verify Consistency Across Nodes
-We ensured both nodes had identical model cache states with the correct revision, which was essential for successful Ray cluster operation.
+Both Sparks sit behind the same internet uplink. I measured it: the head alone pulled 15 MiB/s, and both together pulled 19. Downloading on both nodes means paying for every byte twice on a shared pipe.
 
-## Why This Approach Worked
+The two Sparks also have a 200 Gb QSFP link between them. So: split the files, download half on each node inside its container, then swap halves container to container.
 
-The core insight was that the offline mode setting alone wasn't sufficient to prevent the permission-related issues that were blocking the vLLM service. The solution addressed multiple interconnected problems:
+```bash
+# token goes over stdin, never into a process list or onto the host's disk
+printf '%s\n' "$HF_TOKEN" | ssh spark-head "docker exec -i vllm_node bash -c 'read -r HF_TOKEN; export HF_TOKEN HF_HUB_OFFLINE=0; exec hf download $MODEL --revision $REV <even shards>'"
+```
 
-1. **Permission Issues**: By clearing the cache and manually downloading in offline mode, we ensured proper ownership and file completeness.
-2. **Script Compatibility**: The fix to `clear_model_cache.sh` made it work reliably across different shell environments.
-3. **Consistent State**: Ensuring both nodes had identical, complete model caches was crucial for the distributed Ray cluster setup.
+The swap is tar piped through a few lines of Python socket code, since the image has no `nc`. 78.8 GiB went across in 73 seconds.
 
-## Key Technical Details
+Then preflight failed:
 
-- **Model Revision**: The exact model revision `a608241037e4c2565356bff7ca293f2133888f88` was required to match expected hash.
-- **Node Consistency**: Both DGX Spark nodes (spark-dc25 and spark-a9cf) needed synchronized model cache states.
-- **Cache Integrity**: We verified that model cache directories contained proper file linking and content.
-- **Environment Variables**: The container environment correctly set `HF_HUB_OFFLINE=1` but required manual intervention due to permission restrictions.
+```
+ERR 9 weight file(s) missing on spark-head, e.g. model-hf-nonexpert-00001-of-00004.safetensors
+```
+
+I had split on `model-000NN` shards. The repo also ships `hf-nonexpert`, `mtp` and `inputscales` files that the index points at. Without the new check, vLLM would have tried to fetch them at startup, this time against `HF_HUB_OFFLINE=1`, and failed. One more 15 GiB download on the head, one more swap, and preflight went green.
+
+A few things that bit along the way:
+
+- **Quoting through `ssh`.** `ssh host docker exec c bash -c '...'` re-splits the command on the host, so only the first word runs in the container. Keep the container script inside both quote levels.
+- **`refs/main`.** `hf download --revision <sha>` doesn't write it, and preflight wants it. I copied it over with the head's shards.
+- **Stale `.incomplete` blobs.** The aborted vLLM downloads left 36 GiB of them, and preflight rejects them. Delete them once nothing is downloading.
+- **"of-00036".** The shard names say 36. There are 35.
 
 ## Result
 
-After implementing this solution, the vLLM service started successfully on both nodes. The model was properly loaded in offline mode, and the distributed Ray cluster operated as expected. This approach demonstrates the importance of considering not just environment settings but also file permissions, cache state consistency, and shell compatibility when deploying complex AI models in distributed environments.
+```
+ok healthy after 283s — API: http://spark-head:8000/v1
+```
 
-The solution highlights the nuanced challenges of offline AI model deployment in production environments where permission constraints and distributed systems requirements must all align for successful operation.
+Weights loaded in 35 seconds per rank, the full model load took 71 seconds at 89 GiB per rank, and CUDA graph capture took 34 seconds. Ask it to reply with exactly "ok" and it thinks for 73 tokens and says `ok`.
+
+If your startup log goes quiet at "Loading model from scratch," check the snapshot before you check anything else:
+
+```bash
+cd ~/.cache/huggingface/hub/models--<org>--<model>/snapshots/*/ && ls *.safetensors | wc -l
+```
